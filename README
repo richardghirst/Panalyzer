@@ -1,0 +1,44 @@
+
+                                  Panalyzer
+
+This is a Logic Analyzer that runs on the RaspberryPi.  The basic idea is that
+it disables interrupts for a period, while sampling the GPIO pins once a
+microsecond.  It then re-enables interupts and displays traces showing what the
+relevant GPIO pins were doing.  Clearly the RaspberryPi is frozen while data is
+being gathered, because interrupts are disabled, but a timeout is implemented
+to avoid hanging for ever if a trigger word is not seen.
+
+Panalyzer has features such as specifying trigger patterns, buffer depth, a
+pair of cursors for measuring time periods on the trace, etc.  In the display
+you can click and drag across part of the trace to zoom in on that section.
+
+Not all features are implemented yet, and there is scope to improve
+performance.  The UI may well be reworked as the idea develops.
+
+Currently it expects you to use the following gpio pins:
+
+Channel 0:  GPIO4   (P1-7)
+Channel 1:  GPIO17  (P1-11)
+Channel 2:  GPIO18  (P1-12)
+Channel 3:  GPIO21  (P1-13)
+
+Obviously you should be careful not to damage the RaspberryPi by feeding
+signals above 3.3 volts to those pins.  Personally I added a 7417 open
+collector buffer, driven from 5 volts, but with pullups on the outputs to 3.3
+volts.  The idea being that I could then monitor 5 volt or 3.3 volt based
+circuits safely.
+
+While this project is in very early development, it has been tested monitoring
+signals up to 250KHz, and capturing up to 2 seconds worth of data.  There is
+obviously some sampling error at those speeds, as only it samples at 1000HKz.
+
+Currently you cannot change the sampling frequency; it loops watching a 1MHz
+counter in the processor, and takes a sample every time it changes.
+
+Feedback welcome.
+
+Richard Hirst <richardghirst@gmail.com>  June 6th 2012
+
+['rgh' on the RaspberryPi forum, although I don't spend a lot of time there]
+
+
