@@ -48,7 +48,7 @@
 #include <linux/vmalloc.h>
 #include <linux/cdev.h>
 #include <asm/uaccess.h>
-#include <panalyzer.h>
+#include "panalyzer.h"
 
 static int dev_open(struct inode *, struct file *);
 static int dev_close(struct inode *, struct file *);
