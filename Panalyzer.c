@@ -138,6 +138,37 @@ static void do_draw_cursor(GtkWidget *widget, view_p view, GdkRectangle *rect, i
 	}
 }
 
+static void do_analyze(void)
+{
+#if 0
+	int chan;
+
+	for (chan = 0; chan < sizeof(channels); chan++) {
+		int sig;
+		int psig = 0;
+		int min = 1000000;
+		int max = 0;
+		for (sig = 1; sig < sigcnt; sig++) {
+			if ((sigdata[psig].levels ^ sigdata[sig].levels) & (1<<channels[chan])) {
+				if (psig) {
+					int diff = sigdata[sig].sample - sigdata[psig].sample;
+					if (diff < min) {
+						min = diff;
+//						g_print("Channel %d: saw %d at %d\n", chan, diff, sigdata[sig].sample);
+					}
+					if (diff > max)
+						max = diff;
+//					if (diff < (1 << (5 - chan)))
+//						g_print("Channel %d: saw %d at %d\n", chan, diff, sigdata[sig].sample);
+				}
+				psig = sig;
+			}
+		}
+		g_print("Channel %d: min pulse %d samples, max pulse %d samples\n", chan, min, max);
+	}
+#endif
+}
+
 static void do_draw1(GtkWidget *widget, view_p view)
 {
 	int width = widget->allocation.width;
@@ -436,6 +467,46 @@ static void do_run(GtkWidget *widget, GtkWidget *area) {
 	sigdata[sigcnt].sample = i;
 	sigdata[sigcnt].levels = sigdata[sigcnt-1].levels;
 	do_draw(area);
+	do_analyze();
+}
+
+static gboolean continuous_mode_active = FALSE;
+
+// TODO: Is this called in a different thread?  Do we need locks?
+static gboolean
+time_handler(GtkWidget *widget)
+{
+	static volatile int processing;
+	static volatile int ticker;
+
+	if (processing)
+		;
+	else if (ticker > 0) {
+		ticker--;
+	} else {
+		processing = 1;
+		ticker = 5;
+		do_run(NULL, drawing_area);
+		processing = 0;
+	}
+
+	return continuous_mode_active;
+}
+
+static gboolean do_run_button(GtkWidget *widget, GtkWidget *area)
+{
+	if (continuous_mode_active) {
+		continuous_mode_active = FALSE;
+		gtk_button_set_label(GTK_BUTTON(widget), "Run");
+	}
+	else if (run_mode == 1) {
+		continuous_mode_active = TRUE;
+		gtk_button_set_label(GTK_BUTTON(widget), "Stop");
+		g_timeout_add(10, (GSourceFunc) time_handler, (gpointer) widget);
+	} else {
+		do_run(widget, area);
+	}
+	return TRUE;
 }
 
 static gboolean delete_event(GtkWidget *widget, GdkEvent *event, gpointer data) {
@@ -962,7 +1033,7 @@ int main(int argc, char *argv[]) {
 	/* When the button receives the "clicked" signal, it will call the
 	 * function hello() passing it NULL as its argument.  The hello()
 	 * function is defined above. */
-	g_signal_connect(button, "clicked", G_CALLBACK(do_run), drawing_area);
+	g_signal_connect(button, "clicked", G_CALLBACK(do_run_button), drawing_area);
 
 	for (i = 0; i < 6; i++)
 		label[i] = gtk_label_new("");

@@ -41,6 +41,8 @@
  *  - Ensure relevant GPIO pins are inputs
  */
 
+//#define RUN_FLATOUT
+
 #include <linux/module.h>
 #include <linux/string.h>
 #include <linux/fs.h>
@@ -76,6 +78,7 @@ static volatile uint32_t *ticker;
 static dev_t devno;
 static struct cdev my_cdev;
 static int my_major;
+//static uint32_t foo, bar;
 
 static int capture(void)
 {
@@ -102,16 +105,16 @@ static int capture(void)
 		post_trigger_samples = panctl.num_samples / 20;
 	pre_trigger_samples = panctl.num_samples - post_trigger_samples;
 
-	printk("panctl.num_samples = %d\n", panctl.num_samples);
-	printk("panctl.trigger_point = %d\n", panctl.trigger_point);
-	printk("post_trigger_samples = %d\n", post_trigger_samples);
-	printk("pre_trigger_samples = %d\n", pre_trigger_samples);
-	printk("state = %d, last_state = %d, state_samples = %d\n", state, last_state, state_samples);
-
 	local_irq_disable();
+	local_fiq_disable();
 	start_time = *ticker;
 	t = start_time;
 	abort_time = start_time + (panctl.num_samples > 500000 ? panctl.num_samples * 2 : 1000000);
+#ifdef RUN_FLATOUT
+	while (buf_ptr != buf_end) {
+		*buf_ptr++ = *ticker;
+	}
+#else
 	for (;;) {
 		do { t1 = *ticker; } while (t1 == t);
 		sample = *data;
@@ -151,13 +154,13 @@ recheck:
 			}
 		}
 	}
+#endif
 	end_time = *ticker;
+	local_fiq_enable();
 	local_irq_enable();
 	first_data_index = buf_ptr - buf_start;
 
-	printk(KERN_INFO "buf_start %p, buf_end %p, buf_ptr %p, first_data_index %x\n",
-			buf_start, buf_end, buf_ptr, first_data_index);
-	printk(KERN_INFO "%d samples in %dus, %d overruns\n", panctl.num_samples, end_time - start_time, overruns);
+//	printk(KERN_INFO "%d samples in %dus, %d overruns\n", panctl.num_samples, end_time - start_time, overruns);
 
 	return 0;
 }
@@ -177,7 +180,7 @@ int init_module(void)
 	my_cdev.ops = &fops;
 	res = cdev_add(&my_cdev, MKDEV(my_major, 0), 1);
 	if (res) {
-		printk(KERN_WARNING "Panalyzer: Errpr %d adding device\n", res);
+		printk(KERN_WARNING "Panalyzer: Error %d adding device\n", res);
 		unregister_chrdev_region(devno, 1);
 		return res;
 	}
@@ -201,8 +204,6 @@ void cleanup_module(void)
 static int dev_open(struct inode *inod,struct file *fil)
 {
 	memcpy(&panctl, &def_panctl, sizeof(panctl));
-
-	printk(KERN_ALERT"Device opened\n");
 
 	return 0;
 }
@@ -231,7 +232,7 @@ static ssize_t dev_read(struct file *filp,char *buf,size_t count,loff_t *f_pos)
 		return 0;
 	if (*f_pos < sizeof(panctl_t)) {
 		count = sizeof(panctl_t) - *f_pos;
-		printk(KERN_INFO "READ: returning %x bytes from %p\n", count, (char *)&panctl + *f_pos);
+//		printk(KERN_INFO "READ: returning %x bytes from %p\n", count, (char *)&panctl + *f_pos);
 		if (copy_to_user(buf, (char *)&panctl + *f_pos, count))
 			return -EFAULT;
 	}
@@ -242,10 +243,6 @@ static ssize_t dev_read(struct file *filp,char *buf,size_t count,loff_t *f_pos)
 		int index = *f_pos - sizeof(panctl);
 		char *p = data_start + index;
 
-		printk(KERN_INFO "READ: panctl %p, buffer %p, len %x + %x, data_start %p, count %x, offset %llx\n",
-				&panctl, buffer, sizeof(panctl), panctl.num_samples * sizeof(uint32_t),
-				buffer + first_data_index, count, *f_pos);
-
 		if (p >= end) {
 			p -= end - start;
 			if (count > data_start - p)
@@ -254,7 +251,7 @@ static ssize_t dev_read(struct file *filp,char *buf,size_t count,loff_t *f_pos)
 			count = end - p;
 		}
 
-		printk(KERN_INFO "READ: returning %x bytes from %p\n", count, (char *)buffer + *f_pos);
+//		printk(KERN_INFO "READ: returning %x bytes from %p\n", count, (char *)buffer + *f_pos);
 		if(copy_to_user(buf, p, count))
 			return -EFAULT;
 	}
@@ -289,7 +286,6 @@ static loff_t dev_llseek(struct file *filp, loff_t off, int whence)
 
 static int dev_close(struct inode *inod,struct file *fil)
 {
-	printk(KERN_ALERT"Device closed\n");
 	vfree(buffer);
 	buffer = NULL;
 

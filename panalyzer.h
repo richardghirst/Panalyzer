@@ -44,6 +44,7 @@ typedef panctl_t *panctl_p;
 #define MAX_CHANNELS	8
 
 #define DEF_CHANNELS	{ 4,17,18,21 }
+//#define DEF_CHANNELS	{ 5,4,3,2,1,0 }
 
 #define DEF_PANCTL \
 	{ \
