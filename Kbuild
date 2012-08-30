@@ -1,4 +1,4 @@
-obj-m = pandriver.o
+obj-m = pandriver.o pandriver-dma.o
 
 KERNEL_TREE := /home/richard/Pi/git/linux
 

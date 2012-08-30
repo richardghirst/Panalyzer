@@ -35,10 +35,28 @@ obviously some sampling error at those speeds, as only it samples at 1000HKz.
 Currently you cannot change the sampling frequency; it loops watching a 1MHz
 counter in the processor, and takes a sample every time it changes.
 
+The runtime comprises three files:
+
+pandriver.ko is the kernel module that captures the data.
+Panalyzer is the user space application that displays the data.
+Panalyzer.ui is a Glade generated UI definition, and must be located in
+the directory Panalyzer is invoked from.
+
+If you wish to compile the module yourself, you should follow the instructions
+on the wiki to compile the kernel, then edit the Makefile to point at your
+kernel tree, and then run 'make' in the Panalyzer source directory.  The
+Makefile is currently set up to cross-compile the kernel module; if you are
+building natively remove the ARCH and CROSS_COMPILE settings.
+
+As of August 31st 2012, the included module should load if you have recently
+run rpi-update.  Read the comments at the top of pandriver.c for how to
+create the /dev/paralyzer file.  The included Panalyzer binary uses gtk-3.0
+and should run on Raspbian, at least.
+
 Feedback welcome.
 
-Richard Hirst <richardghirst@gmail.com>  June 6th 2012
+Richard Hirst <richardghirst@gmail.com>  August 31st 2012
 
-['rgh' on the RaspberryPi forum, although I don't spend a lot of time there]
+['rgh' on the RaspberryPi forum]
 
 

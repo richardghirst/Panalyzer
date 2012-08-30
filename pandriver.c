@@ -49,6 +49,7 @@
 #include <linux/io.h>
 #include <linux/vmalloc.h>
 #include <linux/cdev.h>
+#include <mach/platform.h>
 #include <asm/uaccess.h>
 #include "panalyzer.h"
 
@@ -75,6 +76,7 @@ static uint32_t *buffer;
 static uint32_t first_data_index;
 static volatile uint32_t *data;
 static volatile uint32_t *ticker;
+static volatile uint32_t *armtick;
 static dev_t devno;
 static struct cdev my_cdev;
 static int my_major;
@@ -83,6 +85,7 @@ static int my_major;
 static int capture(void)
 {
 	uint32_t start_time, end_time, abort_time, t = 0, t1;
+	uint32_t start_tick, end_tick;
 	uint32_t *buf_start = buffer;
 	uint32_t *buf_end   = buffer + panctl.num_samples;
 	uint32_t *buf_ptr = buf_start;
@@ -108,11 +111,14 @@ static int capture(void)
 	local_irq_disable();
 	local_fiq_disable();
 	start_time = *ticker;
+	start_tick = armtick[8];
 	t = start_time;
 	abort_time = start_time + (panctl.num_samples > 500000 ? panctl.num_samples * 2 : 1000000);
 #ifdef RUN_FLATOUT
+	armtick[2] = 1<<9;
 	while (buf_ptr != buf_end) {
-		*buf_ptr++ = *ticker;
+		volatile uint32_t x = *ticker;
+		*buf_ptr++ = armtick[8];
 	}
 #else
 	for (;;) {
@@ -156,11 +162,13 @@ recheck:
 	}
 #endif
 	end_time = *ticker;
+	end_tick = armtick[8];
 	local_fiq_enable();
 	local_irq_enable();
 	first_data_index = buf_ptr - buf_start;
 
 //	printk(KERN_INFO "%d samples in %dus, %d overruns\n", panctl.num_samples, end_time - start_time, overruns);
+	printk(KERN_INFO "%d samples in %dus\n", end_tick - start_tick, end_time - start_time);
 
 	return 0;
 }
@@ -187,6 +195,7 @@ int init_module(void)
 
 	data = (uint32_t *)ioremap(0x20200034, 4);
 	ticker = (uint32_t *)ioremap(0x20003004, 4);
+	armtick = (uint32_t *)ioremap(0x2000b400, 0x24);
 
 	return 0;
 }
@@ -196,6 +205,7 @@ void cleanup_module(void)
 {
 	iounmap(data);
 	iounmap(ticker);
+	iounmap(armtick);
 	cdev_del(&my_cdev);
 	unregister_chrdev_region(devno, 1);
 }

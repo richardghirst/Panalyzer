@@ -16,19 +16,6 @@
  * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  */
 
-/*
- * TODO:
- * - Comment the code!
- * - Clean up code
- * - Implement code behind the open/save menu options
- * - Show the equivalent frequency for the period between the cursors
- * - Add panning of main view via middle mouse button
- * - Build triggers dialog once at startup
- * - Optimise screen redraw
- * - Optimise data processing
- * - Add option to select channels
- */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -42,19 +29,8 @@
 #include <gtk/gtk.h>
 #include "panalyzer.h"
 
-/* Backing pixmap for drawing area */
-static GdkPixmap *pixmap = NULL;
-static GtkWidget *drawing_area;
-static GtkWidget *label[6];
-static char labeltext[6][32];
-
-static GdkColor zoom_col = { 0, 0xffff, 0xc000, 0xc000 };
-static GdkColor handle_col = { 0, 0x4000, 0x4000, 0xffff };
-static GdkColor trigger_col = { 0, 0xffff, 0x4000, 0x4000 };
-
-static GdkGC *zoom_gc;
-static GdkGC *handle_gc;
-static GdkGC *trigger_gc;
+GtkEntry *Status[4];
+GtkWidget *DrawingArea;
 
 uint8_t channels[] = DEF_CHANNELS;
 
@@ -105,229 +81,337 @@ view_t mainview = {
 		{ 0 }
 };
 
+GtkWidget *main_application_window;
+
+/* Surface to store current scribbles */
+static cairo_surface_t *surface = NULL;
+static cairo_surface_t *preview_cursor = NULL;
+static cairo_surface_t *main_cursor = NULL;
+static cairo_surface_t *main_cursor_off = NULL;
+static int surface_width;
+
 static void error_dialog(const char *fmt, ...);
+static void do_draw(GtkWidget *widget);
+static void prepopulate_data(void);
 
-static void do_draw_cursor(GtkWidget *widget, view_p view, GdkRectangle *rect, int position, GdkGC *gc)
+static int
+sam2pix(view_t *view, int sample)
 {
-	int width = widget->allocation.width;
-	int visible_samples = view->last_sample - view->first_sample;
-	int top = view->top;
-	int bot = top+sizeof(channels)*view->spacing;
-	int x;
+	int samples = view->last_sample - view->first_sample;
 
-	if (position < view->first_sample) {
-		if (rect == NULL)
-			return;
-		x = 0;
-	} else if (position >= view->last_sample) {
-		if (rect == NULL)
-			return;
-		x = width - view->left_margin - view->right_margin;
-	} else {
-		x = (int)((double)(width-view->left_margin-view->right_margin) * (position - view->first_sample) / visible_samples);
-		gdk_draw_line(pixmap, gc, x+view->left_margin,top,x+view->left_margin,bot+view->tails);
-	}
-	if (view->show_handles) {
-		gdk_draw_rectangle(pixmap, gc, TRUE, x-3+view->left_margin, bot+view->tails, 7, 7);
-		if (rect) {
-			rect->x = x-3+view->left_margin;
-			rect->y = bot+view->tails;
-			rect->width = 7;
-			rect->height = 7;
-		}
-	}
+	sample -= view->first_sample;
+
+	return (int)(((double)(surface_width - view->left_margin - view->right_margin) * sample / samples) + view->left_margin + 0.5);
 }
 
-static void do_analyze(void)
+static int
+pix2sam(view_t *view, int pix)
 {
-#if 0
-	int chan;
+	int samples = view->last_sample - view->first_sample;
 
-	for (chan = 0; chan < sizeof(channels); chan++) {
-		int sig;
-		int psig = 0;
-		int min = 1000000;
-		int max = 0;
-		for (sig = 1; sig < sigcnt; sig++) {
-			if ((sigdata[psig].levels ^ sigdata[sig].levels) & (1<<channels[chan])) {
-				if (psig) {
-					int diff = sigdata[sig].sample - sigdata[psig].sample;
-					if (diff < min) {
-						min = diff;
-//						g_print("Channel %d: saw %d at %d\n", chan, diff, sigdata[sig].sample);
-					}
-					if (diff > max)
-						max = diff;
-//					if (diff < (1 << (5 - chan)))
-//						g_print("Channel %d: saw %d at %d\n", chan, diff, sigdata[sig].sample);
-				}
-				psig = sig;
-			}
-		}
-		g_print("Channel %d: min pulse %d samples, max pulse %d samples\n", chan, min, max);
-	}
-#endif
+	pix -= view->left_margin;
+
+	return (int)(((double)(samples) * pix / (surface_width - view->left_margin - view->right_margin)) + view->first_sample + 0.5);
 }
 
-static void do_draw1(GtkWidget *widget, view_p view)
+static void set_status(int entry, const char *fmt, ...)
 {
-	int width = widget->allocation.width;
-	int chan;
-	int xmin = view->left_margin;
-	int xmax = width - view->right_margin;
-	int visible_samples = view->last_sample - view->first_sample;
-	double xscale = (double)(xmax-xmin)/visible_samples;
-	int trigger_samp;
+    va_list ap;
+    char str[128];
 
-	if (prev_panctl.trigger_point == 0)
-		trigger_samp = prev_panctl.num_samples / 20;
-	else if (prev_panctl.trigger_point == 1)
-		trigger_samp = prev_panctl.num_samples / 2;
-	else
-		trigger_samp = prev_panctl.num_samples * 19 / 20;
-
-	do_draw_cursor(widget, view, NULL, trigger_samp, trigger_gc);
-	do_draw_cursor(widget, view, &view->handle1, cursor1, handle_gc);
-	do_draw_cursor(widget, view, &view->handle2, cursor2, handle_gc);
-
-	for (chan = 0; chan < sizeof(channels); chan++) {
-		int logic0 = view->top + (chan+1) * view->spacing;
-		int logic1 = logic0 - view->trace_height;
-		int sig;
-		int psig = 0;
-		int lastx = -1;
-		for (sig = 1; sig < sigcnt; sig++) {
-			if ((sigdata[psig].levels ^ sigdata[sig].levels) & (1<<channels[chan])) {
-				if (sigdata[sig].sample < view->first_sample) {
-				}
-				else if (sigdata[psig].sample < view->first_sample && sigdata[sig].sample >= view->first_sample) {
-					int x1 = xmin;
-					int y1 = sigdata[psig].levels & (1<<channels[chan]) ? logic1 : logic0;
-					int x2 = (int)(xscale * (sigdata[sig].sample - view->first_sample) + xmin + 0.5);
-					if (x2 > xmax)
-						x2 = xmax;
-					int y2 = y1 == logic0 ? logic1 : logic0;
-					gdk_draw_line(pixmap, widget->style->black_gc, x1,y1,x2,y1);
-					if (x2 < xmax)
-						gdk_draw_line(pixmap, widget->style->black_gc, x2,y1,x2,y2);
-				}
-				else if (sigdata[sig].sample > view->last_sample) {
-					break;
-				} else {
-					int x1 = (int)(xscale * (sigdata[psig].sample - view->first_sample) + xmin + 0.5);
-					int y1 = sigdata[psig].levels & (1<<channels[chan]) ? logic1 : logic0;
-					int x2 = (int)(xscale * (sigdata[sig].sample - view->first_sample) + xmin + 0.5);
-					int y2 = y1 == logic0 ? logic1 : logic0;
-					if (x2 != lastx) {
-						gdk_draw_line(pixmap, widget->style->black_gc, x1,y1,x2,y1);
-						gdk_draw_line(pixmap, widget->style->black_gc, x2,y1,x2,y2);
-					}
-					lastx = x2;
-				}
-				psig = sig;
-			}
-		}
-		int x1 = (int)(xscale * (sigdata[psig].sample - view->first_sample) + xmin + 0.5);
-		int y1 = sigdata[psig].levels & (1<<channels[chan]) ? logic1 : logic0;
-		int x2 = (int)(xscale * (sigdata[sig].sample - view->first_sample) + xmin + 0.5);
-		if (sigdata[psig].sample > view->last_sample)
-			x1 = xmax;
-		else if (sigdata[psig].sample < view->first_sample)
-			x1 = xmin;
-		if (sigdata[sig].sample >= view->last_sample)
-			x2 = xmax;
-		if (x1 != x2)
-			gdk_draw_line(pixmap, widget->style->black_gc, x1,y1,x2,y1);
-	}
+    va_start(ap, fmt);
+    vsnprintf(str, 127, fmt, ap);
+    va_end(ap);
+    gtk_entry_set_text(Status[entry], str);
 }
 
-static void do_draw(GtkWidget *widget)
+static void update_delta(void)
 {
-	int width = widget->allocation.width;
-	int height = widget->allocation.height;
-
-	if (pixmap)
-		gdk_pixmap_unref(pixmap);
-
-	pixmap = gdk_pixmap_new(widget->window, width, height, -1);
-	gdk_draw_rectangle(pixmap, widget->style->white_gc, TRUE, 0, 0,
-			width, height);
-
-	zoom_gc = gdk_gc_new(pixmap);
-	gdk_gc_set_rgb_fg_color(zoom_gc, &zoom_col);
-	handle_gc = gdk_gc_new(pixmap);
-	gdk_gc_set_rgb_fg_color(handle_gc, &handle_col);
-	trigger_gc = gdk_gc_new(pixmap);
-	gdk_gc_set_rgb_fg_color(trigger_gc, &trigger_col);
-	// TODO: destroy those GCs when we're done
-
-	PangoLayout *pango = gtk_widget_create_pango_layout(widget, "");
-	int c;
-	for (c = 0; c < sizeof(channels); c++) {
-		char s[4];
-		sprintf(s, "%d", c);
-		pango_layout_set_text(pango, s, 1);
-		gdk_draw_layout(pixmap, widget->style->black_gc, 5, mainview.top + mainview.spacing*c+10, pango);
-	}
-	g_object_unref(pango);
-
-	if (!sigdata)
-		return;
-	int zoom1 = (int)((double)(width - preview.left_margin - preview.right_margin) * mainview.first_sample / prev_panctl.num_samples) + preview.left_margin;
-	int zoom2 = (int)((double)(width - preview.left_margin - preview.right_margin) * mainview.last_sample / prev_panctl.num_samples) + preview.left_margin + 1;
-	gdk_draw_rectangle(pixmap, zoom_gc, TRUE, zoom1, preview.top, zoom2-zoom1, preview.spacing * sizeof(channels) + preview.tails);
-
-	preview.area.x = preview.left_margin;
-	preview.area.y = preview.top;
-	preview.area.width = width - preview.left_margin - preview.right_margin;
-	preview.area.height = preview.spacing * sizeof(channels);
-
-	mainview.area.x = mainview.left_margin;
-	mainview.area.y = mainview.top;
-	mainview.area.width = width - mainview.left_margin - mainview.right_margin;
-	mainview.area.height = mainview.spacing * sizeof(channels);
-
-	int period = (mainview.last_sample - mainview.first_sample);	// in microseconds
-	int ideal_steps = (width-20) / 30;
-	int best_inc = 1;
-	int i = 1;
-	int m = 1;
-	int n = ideal_steps;
-	do {
-		n = period / (i * m);
-		int diff = abs(n - ideal_steps);
-		if (diff < period / best_inc)
-			best_inc = i * m;
-		if (i == 1)
-			i = 2;
-		else if (i == 2)
-			i = 5;
-		else {
-			i = 1;
-			m *= 10;
-		}
-	} while (n > ideal_steps / 2);
-	int xmin = mainview.left_margin;
-	int xmax = width - mainview.right_margin;
-	double xscale = (double)(xmax-xmin)/period;
-	for (i = 0; i < period; i += best_inc) {
-		int x = (int)(xscale * i + mainview.left_margin + 0.5);
-		gdk_draw_line(pixmap, zoom_gc, x,mainview.top,x,mainview.top+mainview.spacing*sizeof(channels)+mainview.tails);
-	}
-	if (best_inc >= 1000)
-		sprintf(labeltext[5], "%dms/div", best_inc / 1000);
-	else
-		sprintf(labeltext[5], "%dus/div", best_inc);
-	gtk_label_set_text(GTK_LABEL(label[5]), labeltext[5]);
 	int delta = abs(cursor2 - cursor1);
+
 	if (delta > 1000)
-		sprintf(labeltext[4], "delta %.3fms", (float)delta/1000);
+		set_status(2, "delta %.3fms", (float)delta/1000);
 	else
-		sprintf(labeltext[4], "delta %dus", delta);
-	gtk_label_set_text(GTK_LABEL(label[4]), labeltext[4]);
-	do_draw1(widget, &preview);
-	do_draw1(widget, &mainview);
-	gtk_widget_queue_draw_area(widget,0,0,width,height);
+		set_status(2, "delta %dus", delta);
+}
+
+static void
+clear_surface (void)
+{
+  cairo_t *cr;
+
+  cr = cairo_create (surface);
+
+  cairo_set_source_rgb (cr, 1, 1, 1);
+  cairo_paint (cr);
+
+  cairo_destroy (cr);
+}
+
+/* Create a new surface of the appropriate size to store our scribbles */
+gboolean
+configure_event_cb (GtkWidget         *widget,
+            GdkEventConfigure *event,
+            gpointer           data)
+{
+  if (surface)
+    cairo_surface_destroy (surface);
+  if (preview_cursor)
+    cairo_surface_destroy(preview_cursor);
+  if (main_cursor)
+    cairo_surface_destroy(main_cursor);
+  if (main_cursor_off)
+    cairo_surface_destroy(main_cursor_off);
+
+  surface_width = gtk_widget_get_allocated_width (widget);
+
+  surface = gdk_window_create_similar_surface (gtk_widget_get_window (widget),
+                                       CAIRO_CONTENT_COLOR,
+                                       gtk_widget_get_allocated_width (widget),
+                                       gtk_widget_get_allocated_height (widget));
+  preview_cursor = gdk_window_create_similar_surface (gtk_widget_get_window (widget),
+                                       CAIRO_CONTENT_COLOR_ALPHA,
+                                       1,
+                                       sizeof(channels) * preview.spacing + preview.tails);
+  main_cursor = gdk_window_create_similar_surface (gtk_widget_get_window (widget),
+                                       CAIRO_CONTENT_COLOR_ALPHA,
+                                       7,
+                                       sizeof(channels) * mainview.spacing + mainview.tails + 7);
+  main_cursor_off = gdk_window_create_similar_surface (gtk_widget_get_window (widget),
+                                       CAIRO_CONTENT_COLOR_ALPHA,
+                                       7, 7);
+
+  cairo_t *cr = cairo_create(preview_cursor);
+  cairo_set_line_width(cr, 1);
+  cairo_set_line_cap(cr, CAIRO_LINE_CAP_SQUARE);
+  cairo_set_source_rgba(cr, 0.25, 0.25, 1.0, 1.0);
+  cairo_move_to(cr, 0.5, 0.5);
+  cairo_line_to(cr, 0.5, sizeof(channels) * preview.spacing + preview.tails - 0.5);
+  cairo_stroke(cr);
+  cairo_destroy(cr);
+
+  mainview.top = sizeof(channels) * preview.spacing + preview.top + 10;
+  cr = cairo_create(main_cursor);
+  cairo_set_line_width(cr, 1);
+  cairo_set_line_cap(cr, CAIRO_LINE_CAP_SQUARE);
+  cairo_set_source_rgba(cr, 0.25, 0.25, 1.0, 1.0);
+  cairo_move_to(cr, 3.5, 0.5);
+  cairo_line_to(cr, 3.5, sizeof(channels) * mainview.spacing + mainview.tails - 0.5);
+  cairo_stroke(cr);
+  cairo_rectangle(cr, 0, sizeof(channels) * mainview.spacing + mainview.tails, 7, 7);
+  cairo_fill(cr);
+  cairo_destroy(cr);
+
+  cr = cairo_create(main_cursor_off);
+  cairo_set_source_rgba(cr, 0.25, 0.25, 1.0, 1.0);
+  cairo_rectangle(cr, 0, 0, 7, 7);
+  cairo_fill(cr);
+  cairo_destroy(cr);
+
+  /* Initialize the surface to white */
+  clear_surface ();
+
+  do_draw(widget);
+  /* We've handled the configure event, no need for further processing. */
+  return TRUE;
+}
+
+/* Redraw the screen from the surface. Note that the ::draw
+ * signal receives a ready-to-be-used cairo_t that is already
+ * clipped to only draw the exposed areas of the widget
+ */
+gboolean
+draw_cb (GtkWidget *widget,
+ cairo_t   *cr,
+ gpointer   data)
+{
+	double x1,x2,y1,y2;
+	cairo_clip_extents(cr,&x1,&y1,&x2,&y2);
+	//g_print("draw_cb: %g %g %g %g\n",x1,y1,x2,y2);
+	// position 'surface' over the drawing area at 0,0, then paint clipped area of drawing area
+  cairo_set_source_surface (cr, surface, 0, 0);
+  cairo_paint (cr);
+  void do1cursor(cairo_t *cr, int cur) {
+  // position 'cursor' over the drawing area at cx,0, the paint the clipped area of drawing area
+	  cairo_set_source_surface (cr, preview_cursor, sam2pix(&preview, cur), preview.top);
+	  cairo_paint (cr);
+    int mx = sam2pix(&mainview, cur);
+    if (mx < mainview.left_margin) {
+      cairo_set_source_surface (cr, main_cursor_off, mainview.left_margin-3, mainview.top + sizeof(channels) * mainview.spacing + mainview.tails);
+    } else if (mx > surface_width - mainview.right_margin) {
+      cairo_set_source_surface (cr, main_cursor_off, surface_width - mainview.right_margin - 3, mainview.top + sizeof(channels) * mainview.spacing + mainview.tails);
+    } else {
+      cairo_set_source_surface (cr, main_cursor, mx-3, mainview.top);
+    }
+    cairo_paint (cr);
+  }
+  do1cursor(cr, cursor1);
+  do1cursor(cr, cursor2);
+
+  return FALSE;
+}
+
+static gint in_rectangle(GdkRectangle *r, GdkEventButton *p) {
+	if (p->x < r->x || p->y < r->y || p->x > r->x+r->width || p->y > r->y + r->height)
+		return 0;
+	else
+		return 1;
+}
+
+gboolean button_press_event_cb(GtkWidget *widget, GdkEventButton *event,
+		gpointer data) {
+	/* paranoia check, in case we haven't gotten a configure event */
+	if (surface == NULL)
+		return FALSE;
+
+	if (event->button == 1) {
+		zoom_down = event->x;
+		if (in_rectangle(&preview.area, event))
+			zooming = 1;
+		else if (in_rectangle(&mainview.area, event))
+			zooming = 2;
+		else if (in_rectangle(&mainview.handle1, event))
+			zooming = 3;
+		else if (in_rectangle(&mainview.handle2, event))
+			zooming = 4;
+	}
+
+	return TRUE;
+}
+
+gboolean
+button_release_event_cb (GtkWidget      *widget,
+               GdkEventButton *event,
+               gpointer        data)
+{
+	if (event->button == 1) {
+		if (zooming == 1 || zooming == 2) {
+			int zoom_up = event->x;
+			int width = surface_width - mainview.left_margin - mainview.right_margin;
+			int zoom_lo = (zoom_down < zoom_up ? zoom_down : zoom_up) - mainview.left_margin;
+			int zoom_hi = (zoom_down > zoom_up ? zoom_down : zoom_up) - mainview.left_margin;
+			int handle_up = zoom_up - mainview.left_margin;
+			if (handle_up < 0)
+				handle_up = 0;
+			else if (handle_up > width)
+				handle_up = width;
+			if (zoom_lo < 0)
+				zoom_lo = 0;
+			if (zoom_hi >= width)
+				zoom_hi = width;
+			if (zooming == 1) {
+				if (abs(zoom_up - zoom_down) < 2)
+					return TRUE;
+				mainview.first_sample = (int)((double)zoom_lo * prev_panctl.num_samples / width);
+				mainview.last_sample = (int)((double)zoom_hi * prev_panctl.num_samples / width);
+			} else if (zooming == 2){
+				int offset = mainview.first_sample;
+				int samples = mainview.last_sample - mainview.first_sample;
+				if (abs(zoom_up - zoom_down) < 2)
+					return TRUE;
+				mainview.first_sample = (int)((double)zoom_lo * samples / width + offset);
+				mainview.last_sample = (int)((double)zoom_hi * samples / width + offset);
+			}
+			do_draw(widget);
+		}
+		zooming = 0;
+	}
+
+	return TRUE;
+}
+
+gboolean
+motion_notify_event_cb (GtkWidget      *widget,
+                GdkEventMotion *event,
+                gpointer        data)
+{
+	int x, y;
+	GdkModifierType state;
+
+  /* paranoia check, in case we haven't gotten a configure event */
+  if (surface == NULL)
+    return FALSE;
+
+  if (event->is_hint)
+		gdk_window_get_pointer(event->window, &x, &y, &state);
+	else {
+		x = event->x;
+		y = event->y;
+		state = event->state;
+	}
+
+	if (state != GDK_BUTTON1_MASK || (zooming != 3 && zooming != 4))
+		return FALSE;
+
+	if (x < mainview.left_margin)
+		x = mainview.left_margin;
+	else if (x > surface_width - mainview.right_margin)
+		x = surface_width - mainview.right_margin;
+
+	void do1cursor(int *cursor, int x, GdkRectangle *rect)
+	{
+		int opx = sam2pix(&preview, *cursor);
+		int omx = sam2pix(&mainview, *cursor);
+		*cursor = pix2sam(&mainview, x);
+		int npx = sam2pix(&preview, *cursor);
+		int nmx = sam2pix(&mainview, *cursor);	// Should = x ...
+		if (omx < mainview.left_margin)
+			omx = mainview.left_margin;
+		else if (omx > surface_width - mainview.right_margin)
+			omx = surface_width - mainview.right_margin;
+
+		//g_print("moved to %d (%d,%d,%d)\n", cursor1,omx,x,nmx);
+		// gdk_window_process_updates() call prevents the two areas being combined in to one larger one
+		// Maybe try XFlush (GDK_DISPLAY ());
+		gtk_widget_queue_draw_area (widget, opx, preview.top, 1, sizeof(channels) * preview.spacing + preview.tails);
+		gtk_widget_queue_draw_area (widget, npx, preview.top, 1, sizeof(channels) * preview.spacing + preview.tails);
+		gdk_window_process_updates(event->window, 1);
+
+		gtk_widget_queue_draw_area (widget, omx-3, mainview.top, 7, sizeof(channels) * mainview.spacing + mainview.tails + 7);
+		gtk_widget_queue_draw_area (widget, nmx-3, mainview.top, 7, sizeof(channels) * mainview.spacing + mainview.tails + 7);
+		gdk_window_process_updates(event->window, 1);
+		rect->x = nmx - 3;
+	}
+	if (zooming == 3)
+		do1cursor(&cursor1, x, &mainview.handle1);
+	else
+		do1cursor(&cursor2, x, &mainview.handle2);
+	update_delta();
+
+	return TRUE;
+}
+
+// TODO This is modal, but it doesn't stop the calling code continuing to run... is that a problem?
+static void error_dialog(const char *fmt, ...)
+{
+    GtkWidget *dialog, *label, *content_area;
+    va_list ap;
+    char str[128];
+
+    va_start(ap, fmt);
+    vsnprintf(str, 127, fmt, ap);
+    va_end(ap);
+
+   /* Create the widgets */
+   dialog = gtk_dialog_new_with_buttons ("Error",
+                                         GTK_WINDOW(main_application_window),
+                                         GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+                                         GTK_STOCK_DIALOG_ERROR,
+                                         GTK_RESPONSE_NONE,
+                                         NULL);
+   content_area = gtk_dialog_get_content_area (GTK_DIALOG (dialog));
+   label = gtk_label_new (str);
+
+   /* Ensure that the dialog box is destroyed when the user responds */
+   g_signal_connect_swapped (dialog,
+                             "response",
+                             G_CALLBACK (gtk_widget_destroy),
+                             dialog);
+
+   /* Add the label, and show everything we've added to the dialog */
+
+   gtk_container_add (GTK_CONTAINER (content_area), label);
+   gtk_widget_show_all (dialog);
 }
 
 static void prepopulate_data(void)
@@ -353,9 +437,233 @@ static void prepopulate_data(void)
 	cursor2 = panctl.num_samples - cursor1;
 }
 
-static void do_run(GtkWidget *widget, GtkWidget *area) {
+static void do_draw_trigger(GtkWidget *widget, cairo_t *cr, view_p view,
+		int position) {
+	int visible_samples = view->last_sample - view->first_sample;
+	int top = view->top;
+	int bot = top + sizeof(channels) * view->spacing;
+	int x;
+
+	if (position < view->first_sample || position >= view->last_sample)
+		return;
+
+	cairo_set_source_rgb(cr, 1.0, 0.25, 0.25);
+
+	x = (int) ((double) (surface_width - view->left_margin
+					- view->right_margin) * (position - view->first_sample)
+					/ visible_samples);
+	cairo_move_to(cr, x + view->left_margin + 0.5, top + 0.5);
+	cairo_line_to(cr, x + view->left_margin + 0.5, bot + view->tails + 0.5);
+	cairo_stroke(cr);
+	if (view->show_handles) {
+		cairo_rectangle(cr, x - 3 + view->left_margin, bot + view->tails, 7, 7);
+		cairo_fill(cr);
+	}
+	cairo_set_source_rgb(cr, 0, 0, 0);
+}
+
+static void do_draw1(GtkWidget *widget, cairo_t *cr, view_p view)
+{
+	int chan;
+	int xmin = view->left_margin;
+	int xmax = surface_width - view->right_margin;
+	int visible_samples = view->last_sample - view->first_sample;
+	double xscale = (double)(xmax-xmin)/visible_samples;
+	int trigger_samp;
+
+	if (prev_panctl.trigger_point == 0)
+		trigger_samp = prev_panctl.num_samples / 20;
+	else if (prev_panctl.trigger_point == 1)
+		trigger_samp = prev_panctl.num_samples / 2;
+	else
+		trigger_samp = prev_panctl.num_samples * 19 / 20;
+
+	do_draw_trigger(widget, cr, view, trigger_samp);
+
+	for (chan = 0; chan < sizeof(channels); chan++) {
+		int logic0 = view->top + (chan+1) * view->spacing;
+		int logic1 = logic0 - view->trace_height;
+		int sig;
+		int psig = 0;
+		int lastx = -1;
+		for (sig = 1; sig < sigcnt; sig++) {
+			if ((sigdata[psig].levels ^ sigdata[sig].levels) & (1<<channels[chan])) {
+				if (sigdata[sig].sample < view->first_sample) {
+				}
+				else if (sigdata[psig].sample < view->first_sample && sigdata[sig].sample >= view->first_sample) {
+					int x1 = xmin;
+					int y1 = sigdata[psig].levels & (1<<channels[chan]) ? logic1 : logic0;
+					int x2 = (int)(xscale * (sigdata[sig].sample - view->first_sample) + xmin + 0.5);
+					if (x2 > xmax)
+						x2 = xmax;
+					int y2 = y1 == logic0 ? logic1 : logic0;
+					cairo_move_to(cr,x1+0.5,y1+0.5);
+					cairo_line_to(cr,x2+0.5,y1+0.5);
+					if (x2 < xmax) {
+						cairo_move_to(cr,x2+0.5,y1+0.5);
+						cairo_line_to(cr,x2+0.5,y2+0.5);
+					}
+				}
+				else if (sigdata[sig].sample > view->last_sample) {
+					break;
+				} else {
+					int x1 = (int)(xscale * (sigdata[psig].sample - view->first_sample) + xmin + 0.5);
+					int y1 = sigdata[psig].levels & (1<<channels[chan]) ? logic1 : logic0;
+					int x2 = (int)(xscale * (sigdata[sig].sample - view->first_sample) + xmin + 0.5);
+					int y2 = y1 == logic0 ? logic1 : logic0;
+					if (x2 != lastx) {
+						cairo_move_to(cr,x1+0.5,y1+0.5);
+						cairo_line_to(cr,x2+0.5,y1+0.5);
+						cairo_move_to(cr,x2+0.5,y1+0.5);
+						cairo_line_to(cr,x2+0.5,y2+0.5);
+					}
+					lastx = x2;
+				}
+				psig = sig;
+			}
+		}
+//		g_print("sigcnt %d\n", sigcnt);
+		int x1 = (int)(xscale * (sigdata[psig].sample - view->first_sample) + xmin + 0.5);
+		int y1 = sigdata[psig].levels & (1<<channels[chan]) ? logic1 : logic0;
+		int x2 = (int)(xscale * (sigdata[sig].sample - view->first_sample) + xmin + 0.5);
+		if (sigdata[psig].sample > view->last_sample)
+			x1 = xmax;
+		else if (sigdata[psig].sample < view->first_sample)
+			x1 = xmin;
+		if (sigdata[sig].sample >= view->last_sample)
+			x2 = xmax;
+		if (x1 != x2) {
+			cairo_move_to(cr,x1+0.5,y1+0.5);
+			cairo_line_to(cr,x2+0.5,y1+0.5);
+		}
+	}
+	cairo_stroke(cr);
+}
+
+static void do_draw(GtkWidget *widget)
+{
+  cairo_t *cr;
+  double x1,y1,x2,y2;
+
+
+  clear_surface();
+  /* Paint to the surface, where we store our state */
+  cr = cairo_create (surface);
+  cairo_clip_extents(cr,&x1,&y1,&x2,&y2);
+  cairo_set_line_width(cr, 1);
+  cairo_set_line_cap(cr, CAIRO_LINE_CAP_SQUARE);
+  
+	int c;
+	for (c = 0; c < sizeof(channels); c++) {
+		char s[4];
+		sprintf(s, "%d", c);
+		cairo_move_to(cr, 5, mainview.top + mainview.spacing*c+22);
+		cairo_show_text(cr, s);
+	}
+
+	int zoom1 = (int)((double)(surface_width - preview.left_margin - preview.right_margin) * mainview.first_sample / prev_panctl.num_samples) + preview.left_margin;
+	int zoom2 = (int)((double)(surface_width - preview.left_margin - preview.right_margin) * mainview.last_sample / prev_panctl.num_samples) + preview.left_margin + 1;
+	cairo_set_source_rgb(cr, 1.0, 0.75, 0.75);
+	cairo_rectangle(cr, zoom1, preview.top, zoom2-zoom1, preview.spacing * sizeof(channels) + preview.tails);
+	cairo_fill(cr);
+	
+	preview.area.x = preview.left_margin;
+	preview.area.y = preview.top;
+	preview.area.width = surface_width - preview.left_margin - preview.right_margin;
+	preview.area.height = preview.spacing * sizeof(channels);
+
+	mainview.area.x = mainview.left_margin;
+	mainview.area.y = mainview.top;
+	mainview.area.width = surface_width - mainview.left_margin - mainview.right_margin;
+	mainview.area.height = mainview.spacing * sizeof(channels);
+
+	c = sam2pix(&mainview, cursor1);
+	if (c < mainview.left_margin)
+		c = mainview.left_margin;
+	else if (c > surface_width - mainview.right_margin)
+		c = surface_width - mainview.right_margin;
+	mainview.handle1.x = c - 3;
+	mainview.handle1.y = mainview.top + sizeof(channels) * mainview.spacing + mainview.tails;
+	mainview.handle1.width = 7;
+	mainview.handle1.height = 7;
+
+	c = sam2pix(&mainview, cursor2);
+	if (c < mainview.left_margin)
+		c = mainview.left_margin;
+	else if (c > surface_width - mainview.right_margin)
+		c = surface_width - mainview.right_margin;
+	mainview.handle2.x = c - 3;
+	mainview.handle2.y = mainview.top + sizeof(channels) * mainview.spacing + mainview.tails;
+	mainview.handle2.width = 7;
+	mainview.handle2.height = 7;
+
+	int period = (mainview.last_sample - mainview.first_sample);	// in microseconds
+	int ideal_steps = (surface_width-20) / 30;
+	int best_inc = 1;
+	int i = 1;
+	int m = 1;
+	int n = ideal_steps;
+	do {
+		n = period / (i * m);
+		int diff = abs(n - ideal_steps);
+		if (diff < period / best_inc)
+			best_inc = i * m;
+		if (i == 1)
+			i = 2;
+		else if (i == 2)
+			i = 5;
+		else {
+			i = 1;
+			m *= 10;
+		}
+	} while (n > ideal_steps / 2);
+	int xmin = mainview.left_margin;
+	int xmax = surface_width - mainview.right_margin;
+	double xscale = (double)(xmax-xmin)/period;
+	cairo_set_source_rgb(cr, 1.0, 0.75, 0.75);
+	for (i = 0; i < period; i += best_inc) {
+		int x = (int)(xscale * i + mainview.left_margin + 0.5);
+		cairo_move_to(cr,x+0.5,mainview.top+0.5);
+		cairo_line_to(cr,x+0.5,mainview.top+mainview.spacing*sizeof(channels)+mainview.tails+0.5);
+	}
+	cairo_stroke(cr);
+	cairo_set_source_rgb(cr, 0, 0, 0);
+
+	if (best_inc >= 1000)
+		set_status(3, "%dms/div", best_inc / 1000);
+	else
+		set_status(3, "%dus/div", best_inc);
+	update_delta();
+
+	do_draw1(widget, cr, &preview);
+	do_draw1(widget, cr, &mainview);
+
+//  cairo_path_extents(cr,&x1,&y1,&x2,&y2);
+  cairo_stroke(cr);
+
+  cairo_destroy (cr);
+
+  /* Now invalidate the affected region of the drawing area. */
+//  g_print("%g %g %g %g\n",x1,y1,x2,y2);
+  gtk_widget_queue_draw_area (widget, x1, y1, x2-x1, y2-y1);
+}
+
+void do_zoom(GtkWidget *widget, gpointer data) {
+	int offset = preview.last_sample * (100 - (int) (long) data) / 2 / 100;
+	int num_samples;
+
+	mainview.first_sample = offset;
+	mainview.last_sample = preview.last_sample - offset;
+	num_samples = mainview.last_sample - mainview.first_sample;
+	cursor1 = mainview.first_sample + num_samples / 50;
+	cursor2 = mainview.last_sample - num_samples / 50;
+	do_draw(DrawingArea);
+}
+
+void do_run(GtkWidget *widget, gpointer data) {
 	int fd, res;
 
+#if 1
 	fd = open("/dev/panalyzer", O_RDWR);
 	if (fd >= 0) {
 		res = write(fd, &panctl, sizeof(panctl));
@@ -366,6 +674,9 @@ static void do_run(GtkWidget *widget, GtkWidget *area) {
 		}
 	} else {
 		error_dialog("Couldn't open device (%s), trying trace.bin", strerror(errno));
+#else
+	{
+#endif
 		fd = open("trace.bin", O_RDONLY);
 		if (fd < 0) {
 			error_dialog("Couldn't open trace.bin: %s", strerror(errno));
@@ -382,14 +693,15 @@ static void do_run(GtkWidget *widget, GtkWidget *area) {
 
 	res = read(fd, &panctl, sizeof(panctl));
 	if (res < 0) {
-		error_dialog("Couldn't read panctl: %s", strerror(errno));
+		if (run_mode == 0)
+			error_dialog("Couldn't read panctl: %s", strerror(errno));
 		close(fd);
 		return;
 	} else 	if (res != sizeof(panctl)) {
 		error_dialog("Couldn't read panctl (%d read)", res);
 		prepopulate_data();
 		close(fd);
-		do_draw(area);
+		do_draw(widget);
 		return;
 	}
 
@@ -397,7 +709,7 @@ static void do_run(GtkWidget *widget, GtkWidget *area) {
 		error_dialog("Bad magic in data");
 		prepopulate_data();
 		close(fd);
-		do_draw(area);
+		do_draw(widget);
 		return;
 	}
 
@@ -428,7 +740,7 @@ static void do_run(GtkWidget *widget, GtkWidget *area) {
 					siz - cnt, cnt, strerror(errno));
 			prepopulate_data();
 			close(fd);
-			do_draw(area);
+			do_draw(widget);
 			return;
 		}
 	}
@@ -449,7 +761,7 @@ static void do_run(GtkWidget *widget, GtkWidget *area) {
 	for (i = 0; i < sizeof(channels); i++)
 		mask |= 1 << channels[i];
 	// TODO realloc sigdata as necessary
-	sigdata = (sigdata_p)malloc(sizeof(sigdata_t)*panctl.num_samples);
+	sigdata = (sigdata_p)malloc(sizeof(sigdata_t)*(panctl.num_samples+1));
 	if (sigdata == NULL) {
 		error_dialog("Failed to malloc sigdata: %s", strerror(errno));
 		gtk_main_quit();
@@ -458,6 +770,7 @@ static void do_run(GtkWidget *widget, GtkWidget *area) {
 	sigdata[sigcnt].sample = 0;
 	sigdata[sigcnt].levels = tracedata[0] & mask;
 	for (i = 1; i < panctl.num_samples; i++) {
+//		tracedata[i] ^= (i&1)<<4;
 		if ((tracedata[i] & mask) != sigdata[sigcnt].levels) {
 			sigdata[++sigcnt].sample = i;
 			sigdata[sigcnt].levels = tracedata[i] & mask;
@@ -466,9 +779,22 @@ static void do_run(GtkWidget *widget, GtkWidget *area) {
 	sigcnt++;
 	sigdata[sigcnt].sample = i;
 	sigdata[sigcnt].levels = sigdata[sigcnt-1].levels;
-	do_draw(area);
-	do_analyze();
+	do_draw(widget);
+//	do_analyze();
 }
+
+void do_run_mode(GtkWidget *widget, gpointer data) {
+	run_mode = (int)(long)data;
+}
+
+void do_trigger_position(GtkWidget *widget, gpointer data) {
+	panctl.trigger_point = (int)(long)data;
+}
+
+void do_buffer_size(GtkWidget *widget, gpointer data) {
+	panctl.num_samples = (int)(long)data * 1000;
+}
+
 
 static gboolean continuous_mode_active = FALSE;
 
@@ -486,225 +812,27 @@ time_handler(GtkWidget *widget)
 	} else {
 		processing = 1;
 		ticker = 5;
-		do_run(NULL, drawing_area);
+		do_run(DrawingArea, NULL);
 		processing = 0;
 	}
 
 	return continuous_mode_active;
 }
 
-static gboolean do_run_button(GtkWidget *widget, GtkWidget *area)
+gboolean do_run_button(GtkWidget *widget, GtkWidget *area)
 {
 	if (continuous_mode_active) {
 		continuous_mode_active = FALSE;
-		gtk_button_set_label(GTK_BUTTON(widget), "Run");
+		gtk_tool_button_set_stock_id(GTK_TOOL_BUTTON(widget), GTK_STOCK_GO_FORWARD);
 	}
 	else if (run_mode == 1) {
 		continuous_mode_active = TRUE;
-		gtk_button_set_label(GTK_BUTTON(widget), "Stop");
+		gtk_tool_button_set_stock_id(GTK_TOOL_BUTTON(widget), GTK_STOCK_STOP);
 		g_timeout_add(10, (GSourceFunc) time_handler, (gpointer) widget);
 	} else {
-		do_run(widget, area);
+		do_run(area, NULL);
 	}
 	return TRUE;
-}
-
-static gboolean delete_event(GtkWidget *widget, GdkEvent *event, gpointer data) {
-	/* If you return FALSE in the "delete-event" signal handler,
-	 * GTK will emit the "destroy" signal. Returning TRUE means
-	 * you don't want the window to be destroyed.
-	 * This is useful for popping up 'are you sure you want to quit?'
-	 * type dialogs. */
-
-	/* Change TRUE to FALSE and the main window will be destroyed with
-	 * a "delete-event". */
-
-	return FALSE;
-}
-
-/* Create a new backing pixmap of the appropriate size */
-static gint configure_event(GtkWidget *widget, GdkEventConfigure *event) {
-	do_draw(widget);
-
-	return TRUE;
-}
-
-/* Redraw the screen from the backing pixmap */
-static gint expose_event(GtkWidget *widget, GdkEventExpose *event) {
-	gdk_draw_pixmap(widget->window,
-			widget->style->fg_gc[GTK_WIDGET_STATE (widget)], pixmap,
-			event->area.x, event->area.y, event->area.x, event->area.y,
-			event->area.width, event->area.height);
-
-	return FALSE;
-}
-
-static gint in_rectangle(GdkRectangle *r, GdkEventButton *p) {
-	if (p->x < r->x || p->y < r->y || p->x > r->x+r->width || p->y > r->y + r->height)
-		return 0;
-	else
-		return 1;
-}
-
-static gint button_press_event(GtkWidget *widget, GdkEventButton *event) {
-	if (event->button == 1 && pixmap != NULL) {
-		zoom_down = event->x;
-		if (in_rectangle(&preview.area, event))
-			zooming = 1;
-		else if (in_rectangle(&mainview.area, event))
-			zooming = 2;
-		else if (in_rectangle(&mainview.handle1, event))
-			zooming = 3;
-		else if (in_rectangle(&mainview.handle2, event))
-			zooming = 4;
-	}
-//	draw_brush(widget, event->x, event->y);
-
-	return TRUE;
-}
-
-static gint button_release_event(GtkWidget *widget, GdkEventButton *event) {
-	if (event->button == 1 && pixmap != NULL) {
-		if (zooming) {
-			int zoom_up = event->x;
-			int width = widget->allocation.width - mainview.left_margin - mainview.right_margin;
-			int zoom_lo = (zoom_down < zoom_up ? zoom_down : zoom_up) - mainview.left_margin;
-			int zoom_hi = (zoom_down > zoom_up ? zoom_down : zoom_up) - mainview.left_margin;
-			int handle_up = zoom_up - mainview.left_margin;
-			if (handle_up < 0)
-				handle_up = 0;
-			else if (handle_up > width)
-				handle_up = width;
-			if (zoom_lo < 0)
-				zoom_lo = 0;
-			if (zoom_hi >= width)
-				zoom_hi = width;
-			if (zooming == 1) {
-				if (abs(zoom_up - zoom_down) < 2)
-					return TRUE;
-				mainview.first_sample = (int)((double)zoom_lo * prev_panctl.num_samples / width);
-				mainview.last_sample = (int)((double)zoom_hi * prev_panctl.num_samples / width);
-			} else if (zooming == 2){
-				int offset = mainview.first_sample;
-				int samples = mainview.last_sample - mainview.first_sample;
-				if (abs(zoom_up - zoom_down) < 2)
-					return TRUE;
-				mainview.first_sample = (int)((double)zoom_lo * samples / width + offset);
-				mainview.last_sample = (int)((double)zoom_hi * samples / width + offset);
-			} else if (zooming == 3) {
-				int samples = mainview.last_sample - mainview.first_sample;
-				cursor1 = (int)((double)handle_up * samples / width + mainview.first_sample);
-			} else if (zooming == 4) {
-				int samples = mainview.last_sample - mainview.first_sample;
-				cursor2 = (int)((double)handle_up * samples / width + mainview.first_sample);
-			}
-			zooming = 0;
-			do_draw(widget);
-		}
-	}
-
-	return TRUE;
-}
-
-static gint motion_notify_event(GtkWidget *widget, GdkEventMotion *event) {
-	int x, y;
-	GdkModifierType state;
-	int width = widget->allocation.width - mainview.left_margin - mainview.right_margin;
-	int handle_up;
-
-	if (event->is_hint)
-		gdk_window_get_pointer(event->window, &x, &y, &state);
-	else {
-		x = event->x;
-		y = event->y;
-		state = event->state;
-	}
-
-	if (state != GDK_BUTTON1_MASK || pixmap == NULL)
-		return TRUE;
-
-	handle_up = x - mainview.left_margin;
-	if (zooming == 3) {
-		int samples = mainview.last_sample - mainview.first_sample;
-		cursor1 = (int)((double)handle_up * samples / width + mainview.first_sample);
-		do_draw(widget);
-	} else if (zooming == 4) {
-		int samples = mainview.last_sample - mainview.first_sample;
-		cursor2 = (int)((double)handle_up * samples / width + mainview.first_sample);
-		do_draw(widget);	// TODO This redraws the whole window.. not very efficient
-	}
-
-	return TRUE;
-}
-
-/* Another callback */
-static void destroy(GtkWidget *widget, gpointer data) {
-	gtk_main_quit();
-}
-
-static void do_trigger_position(GtkWidget *widget, gpointer data) {
-	panctl.trigger_point = (int)(long)data;
-}
-
-static void do_buffer_size(GtkWidget *widget, gpointer data) {
-	panctl.num_samples = (int)(long)data * 1000;
-}
-
-static void do_run_mode(GtkWidget *widget, gpointer data) {
-	run_mode = (int)(long)data;
-}
-
-static void do_zoom(GtkWidget *widget, gpointer data) {
-	int offset = preview.last_sample * (100 - (int)(long)data) / 2 / 100;
-	int num_samples;
-
-	mainview.first_sample = offset;
-	mainview.last_sample = preview.last_sample - offset;
-	num_samples = mainview.last_sample - mainview.first_sample;
-	cursor1 = mainview.first_sample + num_samples / 50;
-	cursor2 = mainview.last_sample - num_samples / 50;
-	do_draw(drawing_area);
-}
-
-#if 0
-/* Draw a rectangle on the screen */
-static void draw_brush(GtkWidget *widget, gdouble x, gdouble y) {
-	GdkRectangle update_rect;
-
-	update_rect.x = x - 1;
-	update_rect.y = y - 1;
-	update_rect.width = 3;
-	update_rect.height = 3;
-	gdk_draw_rectangle(pixmap, widget->style->black_gc, TRUE, update_rect.x,
-			update_rect.y, update_rect.width, update_rect.height);
-	gtk_widget_draw(widget, &update_rect);
-}
-#endif
-
-static void error_dialog(const char *fmt, ...)
-{
-    GtkWidget *dialog, *label;
-    va_list ap;
-    char str[128];
-
-    va_start(ap, fmt);
-    vsnprintf(str, 127, fmt, ap);
-    va_end(ap);
-    dialog = gtk_dialog_new_with_buttons("Error", NULL, 0,
-                                         GTK_STOCK_OK,
-                                         GTK_RESPONSE_OK,
-                                         NULL);
-    gtk_dialog_set_has_separator(GTK_DIALOG(dialog), TRUE);
-    gtk_dialog_set_default_response(GTK_DIALOG(dialog), GTK_RESPONSE_OK);
-
-    label = gtk_label_new(str);
-    gtk_label_set_line_wrap(GTK_LABEL(label), TRUE);
-    gtk_label_set_width_chars(GTK_LABEL(label), 40);
-    gtk_container_add(GTK_CONTAINER(GTK_DIALOG(dialog)->vbox), label);
-
-    gtk_widget_show_all(dialog);
-    gtk_dialog_run(GTK_DIALOG(dialog));
-    gtk_widget_destroy(dialog);
 }
 
 static void do_level_select(GtkWidget *widget, gpointer data) {
@@ -767,8 +895,8 @@ static gboolean do_trig_samples_focus(GtkWidget *widget, gpointer data) {
 	return FALSE;
 }
 
-static void do_trigger_dialog(GtkWidget *widget, gpointer data) {
-	GtkWidget *dialog;
+void do_trigger_dialog(GtkWidget *widget, gpointer data) {
+	GtkWidget *dialog, *content_area;
 	int i, t;
 	GtkWidget *trig_enables[MAX_TRIGGERS];
 	GtkWidget *trig_samples[MAX_TRIGGERS];
@@ -776,15 +904,16 @@ static void do_trigger_dialog(GtkWidget *widget, gpointer data) {
 
 	dialog = gtk_dialog_new_with_buttons("Trigger Conditions", NULL, 0,
 			GTK_STOCK_CANCEL, GTK_RESPONSE_CANCEL, GTK_STOCK_OK, GTK_RESPONSE_OK, NULL);
+	content_area = gtk_dialog_get_content_area (GTK_DIALOG (dialog));
 	GtkWidget *grid = gtk_table_new(MAX_TRIGGERS+2, sizeof(channels)+3, FALSE);
-	gtk_box_pack_start (GTK_BOX(GTK_DIALOG(dialog)->vbox), grid, FALSE, TRUE, 10);
+	gtk_container_add (GTK_CONTAINER(content_area), grid);
 	gtk_table_attach(GTK_TABLE(grid),
 			gtk_label_new("Channels"),
 			2, sizeof(channels)+2, 0, 1,
 			0, 0,
 			4, 4);
 	for (i = 0; i < sizeof(channels); i++) {
-		char txt[4];
+		char txt[10];
 		sprintf(txt,"  [%d]  ", i);
 		gtk_table_attach(GTK_TABLE(grid),
 				gtk_label_new(txt),
@@ -884,187 +1013,54 @@ static void do_trigger_dialog(GtkWidget *widget, gpointer data) {
 	gtk_widget_destroy(dialog);
 }
 
-/* This is the GtkItemFactoryEntry structure used to generate new menus.
-   Item 1: The menu path. The letter after the underscore indicates an
-           accelerator key once the menu is open.
-   Item 2: The accelerator key for the entry
-   Item 3: The callback function.
-   Item 4: The callback action.  This changes the parameters with
-           which the function is called.  The default is 0.
-   Item 5: The item type, used to define what kind of an item it is.
-           Here are the possible values:
-
-           NULL               -> "<Item>"
-           ""                 -> "<Item>"
-           "<Title>"          -> create a title item
-           "<Item>"           -> create a simple item
-           "<CheckItem>"      -> create a check item
-           "<ToggleItem>"     -> create a toggle item
-           "<RadioItem>"      -> create a radio item
-           <path>             -> path of a radio item to link against
-           "<Separator>"      -> create a separator
-           "<Branch>"         -> create an item to hold sub items (optional)
-           "<LastBranch>"     -> create a right justified branch
-*/
-
-static GtkItemFactoryEntry menu_items[] = {
-	{ "/_File",								NULL,			NULL,					0,		"<Branch>"							},
-	{ "/File/_Open",						"<control>O",	NULL,					0,		NULL								},
-	{ "/File/_Save As",						"<control>S",	NULL,					0,		NULL								},
-	{ "/File/sep1",							NULL,			NULL,					0,		"<Separator>"						},
-	{ "/File/Quit",							"<control>Q",	gtk_main_quit,			0,		NULL								},
-	{ "/_Options",							NULL,			NULL,					0,		"<Branch>"							},
-	{ "/Options/Run Mode",					NULL,			NULL,					0,		"<Branch>"							},
-	{ "/Options/Run Mode/Single Shot",		NULL,			do_run_mode,			0,		"<RadioItem>"						},
-	{ "/Options/Run Mode/Continuous",		NULL,			do_run_mode,			1,		"/Options/Run Mode/Single Shot"		},
-	{ "/Options/Trigger Position",			NULL,			NULL,					0,		"<Branch>"							},
-	{ "/Options/Trigger Position/Start",	NULL,			do_trigger_position,	0,		"<RadioItem>"						},
-	{ "/Options/Trigger Position/Centre",	NULL,			do_trigger_position,	1,		"/Options/Trigger Position/Start"	},
-	{ "/Options/Trigger Position/End",		NULL,			do_trigger_position,	2,		"/Options/Trigger Position/Start"	},
-	{ "/Options/Trigger Condition...",		"<control>T",	do_trigger_dialog,		0,		NULL								},
-	{ "/Options/Buffer Size",				NULL,			NULL,					0,		"<Branch>"							},
-	{ "/Options/Buffer Size/10ms",			NULL,			do_buffer_size,			10,		"<RadioItem>"						},
-	{ "/Options/Buffer Size/20ms",			NULL,			do_buffer_size,			20,		"/Options/Buffer Size/10ms"			},
-	{ "/Options/Buffer Size/50ms",			NULL,			do_buffer_size,			50,		"/Options/Buffer Size/10ms"			},
-	{ "/Options/Buffer Size/100ms",			NULL,			do_buffer_size,			100,	"/Options/Buffer Size/10ms"			},
-	{ "/Options/Buffer Size/200ms",			NULL,			do_buffer_size,			200,	"/Options/Buffer Size/10ms"			},
-	{ "/Options/Buffer Size/500ms",			NULL,			do_buffer_size,			500,	"/Options/Buffer Size/10ms"			},
-	{ "/Options/Buffer Size/1000ms",		NULL,			do_buffer_size,			1000,	"/Options/Buffer Size/10ms"			},
-	{ "/Options/Buffer Size/2000ms",		NULL,			do_buffer_size,			2000,	"/Options/Buffer Size/10ms"			},
-	{ "/Zoom",								NULL,			NULL,					0,		"<Branch>"							},
-	{ "/Zoom/100%",							NULL,			do_zoom,				100,	NULL								},
-//	{ "/Zoom/50%",							NULL,			do_zoom,				50,		NULL								},
-//	{ "/Zoom/20%",							NULL,			do_zoom,				20,		NULL								},
-//	{ "/Zoom/10%",							NULL,			do_zoom,				10,		NULL								},
-	{ "/_Help",								NULL,			NULL,					0,		"<Branch>"							},
-	{ "/_Help/About",						NULL,			NULL,					0,		NULL								},
-};
-
-
-GtkWidget *get_main_menu( GtkWidget  *window)
+int
+main (int   argc,
+	  char *argv[])
 {
-  GtkItemFactory *item_factory;
-  GtkAccelGroup *accel_group;
-  gint nmenu_items = sizeof (menu_items) / sizeof (menu_items[0]);
+  GtkBuilder *builder;
+  GObject *window;
+  int i;
 
-  accel_group = gtk_accel_group_new ();
+  prepopulate_data();
 
-  /* This function initializes the item factory.
-     Param 1: The type of menu - can be GTK_TYPE_MENU_BAR, GTK_TYPE_MENU,
-              or GTK_TYPE_OPTION_MENU.
-     Param 2: The path of the menu.
-     Param 3: A pointer to a gtk_accel_group.  The item factory sets up
-              the accelerator table while generating menus.
-  */
+  gtk_init (&argc, &argv);
 
-  item_factory = gtk_item_factory_new (GTK_TYPE_MENU_BAR, "<main>",
-                                       accel_group);
+  /* Construct a GtkBuilder instance and load our UI description */
+  builder = gtk_builder_new ();
+  gtk_builder_add_from_file (builder, "Panalyzer.ui", NULL);
 
-  /* This function generates the menu items. Pass the item factory,
-     the number of items in the array, the array itself, and any
-     callback data for the the menu items. */
-  gtk_item_factory_create_items (item_factory, nmenu_items, menu_items, NULL);
+  /* Connect signal handlers to the constructed widgets. */
+  window = gtk_builder_get_object (builder, "MainWindow");
+  gtk_builder_connect_signals(builder, NULL);
 
-  /* Attach the new accelerator group to the window. */
-  gtk_window_add_accel_group (GTK_WINDOW (window), accel_group);
+  for (i = 0; i < 4; i++) {
+	  char txt[16];
+	  sprintf(txt, "status%d", i);
+	  Status[i] = GTK_ENTRY(gtk_builder_get_object (builder, txt));
+  }
+  DrawingArea = GTK_WIDGET(gtk_builder_get_object(builder, "DrawingArea"));
+  // Sadly glade will only let you specify objects as user data in callbacks, so to pass simple values we have to connect them manually
+  g_signal_connect(GTK_WIDGET(gtk_builder_get_object(builder, "run_single_shot_btn")), "activate", G_CALLBACK(do_run_mode), (gpointer)0);
+  g_signal_connect(GTK_WIDGET(gtk_builder_get_object(builder, "run_continuous_btn")), "activate", G_CALLBACK(do_run_mode), (gpointer)1);
+  g_signal_connect(GTK_WIDGET(gtk_builder_get_object(builder, "zoom100_btn")), "activate", G_CALLBACK(do_zoom), (gpointer)100);
+  g_signal_connect(GTK_WIDGET(gtk_builder_get_object(builder, "zoom50_btn")), "activate", G_CALLBACK(do_zoom), (gpointer)50);
+  g_signal_connect(GTK_WIDGET(gtk_builder_get_object(builder, "zoom25_btn")), "activate", G_CALLBACK(do_zoom), (gpointer)25);
 
-    /* Finally, return the actual menu bar created by the item factory. */
-    return gtk_item_factory_get_widget (item_factory, "<main>");
+  g_signal_connect(GTK_WIDGET(gtk_builder_get_object(builder, "buf_10ms_btn")), "activate", G_CALLBACK(do_buffer_size), (gpointer)10);
+  g_signal_connect(GTK_WIDGET(gtk_builder_get_object(builder, "buf_20ms_btn")), "activate", G_CALLBACK(do_buffer_size), (gpointer)20);
+  g_signal_connect(GTK_WIDGET(gtk_builder_get_object(builder, "buf_50ms_btn")), "activate", G_CALLBACK(do_buffer_size), (gpointer)50);
+  g_signal_connect(GTK_WIDGET(gtk_builder_get_object(builder, "buf_100ms_btn")), "activate", G_CALLBACK(do_buffer_size), (gpointer)100);
+  g_signal_connect(GTK_WIDGET(gtk_builder_get_object(builder, "buf_200ms_btn")), "activate", G_CALLBACK(do_buffer_size), (gpointer)200);
+  g_signal_connect(GTK_WIDGET(gtk_builder_get_object(builder, "buf_500ms_btn")), "activate", G_CALLBACK(do_buffer_size), (gpointer)500);
+  g_signal_connect(GTK_WIDGET(gtk_builder_get_object(builder, "buf_1000ms_btn")), "activate", G_CALLBACK(do_buffer_size), (gpointer)1000);
+  g_signal_connect(GTK_WIDGET(gtk_builder_get_object(builder, "buf_2000ms_btn")), "activate", G_CALLBACK(do_buffer_size), (gpointer)2000);
+
+  g_signal_connect(GTK_WIDGET(gtk_builder_get_object(builder, "trig_start_btn")), "activate", G_CALLBACK(do_trigger_position), (gpointer)0);
+  g_signal_connect(GTK_WIDGET(gtk_builder_get_object(builder, "trig_centre_btn")), "activate", G_CALLBACK(do_trigger_position), (gpointer)1);
+  g_signal_connect(GTK_WIDGET(gtk_builder_get_object(builder, "trig_end_btn")), "activate", G_CALLBACK(do_trigger_position), (gpointer)2);
+
+  gtk_widget_show_all (GTK_WIDGET(window));
+  gtk_main ();
+
+  return 0;
 }
-
-int main(int argc, char *argv[]) {
-	/* GtkWidget is the storage type for widgets */
-	GtkWidget *window;
-	GtkWidget *vbox;
-	GtkWidget *button;
-	int i;
-
-	prepopulate_data();
-
-	/* This is called in all GTK applications. Arguments are parsed
-	 * from the command line and are returned to the application. */
-	gtk_init(&argc, &argv);
-
-	/* create a new window */
-	window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-
-	/* When the window is given the "delete-event" signal (this is given
-	 * by the window manager, usually by the "close" option, or on the
-	 * titlebar), we ask it to call the delete_event () function
-	 * as defined above. The data passed to the callback
-	 * function is NULL and is ignored in the callback function. */
-	g_signal_connect(window, "delete-event", G_CALLBACK(delete_event), NULL);
-
-	/* Here we connect the "destroy" event to a signal handler.
-	 * This event occurs when we call gtk_widget_destroy() on the window,
-	 * or if we return FALSE in the "delete-event" callback. */
-	g_signal_connect(window, "destroy", G_CALLBACK(destroy), NULL);
-
-	/* Sets the border width of the window. */
-	gtk_container_set_border_width(GTK_CONTAINER (window), 1);
-
-	vbox = gtk_vbox_new(FALSE, 0);
-	gtk_container_add (GTK_CONTAINER (window), vbox);
-
-	/* create the drawing area */
-	drawing_area = gtk_drawing_area_new();
-
-	gtk_drawing_area_size(GTK_DRAWING_AREA(drawing_area), 400, 180);
-
-	gtk_signal_connect (GTK_OBJECT (drawing_area), "expose_event",
-			(GtkSignalFunc) expose_event, NULL);
-	gtk_signal_connect (GTK_OBJECT(drawing_area),"configure_event",
-			(GtkSignalFunc) configure_event, NULL);
-	gtk_signal_connect (GTK_OBJECT (drawing_area), "motion_notify_event",
-			(GtkSignalFunc) motion_notify_event, NULL);
-	gtk_signal_connect (GTK_OBJECT (drawing_area), "button_press_event",
-			(GtkSignalFunc) button_press_event, NULL);
-	gtk_signal_connect (GTK_OBJECT (drawing_area), "button_release_event",
-			(GtkSignalFunc) button_release_event, NULL);
-
-	gtk_widget_set_events(drawing_area, GDK_EXPOSURE_MASK
-			| GDK_LEAVE_NOTIFY_MASK | GDK_BUTTON_PRESS_MASK
-			| GDK_BUTTON_RELEASE_MASK
-			| GDK_POINTER_MOTION_MASK | GDK_POINTER_MOTION_HINT_MASK);
-
-	/* Creates a new button with the label "Hello World". */
-	button = gtk_button_new_with_label("Run");
-
-	/* When the button receives the "clicked" signal, it will call the
-	 * function hello() passing it NULL as its argument.  The hello()
-	 * function is defined above. */
-	g_signal_connect(button, "clicked", G_CALLBACK(do_run_button), drawing_area);
-
-	for (i = 0; i < 6; i++)
-		label[i] = gtk_label_new("");
-
-	GtkWidget *menubox = gtk_hbox_new(FALSE, 0);
-	GtkWidget *menu = get_main_menu(window);
-	gtk_box_pack_start (GTK_BOX(vbox), menubox, FALSE, TRUE, 0);
-	gtk_box_pack_start (GTK_BOX(menubox), menu, TRUE, TRUE, 0);
-	gtk_box_pack_end (GTK_BOX(menubox), button, FALSE, TRUE, 0);
-	gtk_box_pack_start (GTK_BOX(vbox), drawing_area, TRUE, TRUE, 0);
-	GtkWidget *labelbox = gtk_hbox_new(FALSE, 0);
-	gtk_box_pack_start (GTK_BOX(vbox), labelbox, FALSE, TRUE, 0);
-	for (i = 0; i < 6; i++)
-		gtk_box_pack_start (GTK_BOX(labelbox), label[i], TRUE, TRUE, 0);
-
-	/* The final step is to display everything. */
-	gtk_widget_show(menubox);
-	gtk_widget_show(menu);
-	gtk_widget_show(button);
-	gtk_widget_show(drawing_area);
-	gtk_widget_show(labelbox);
-	for (i = 0; i < 6; i++)
-		gtk_widget_show(label[i]);
-	gtk_widget_show(vbox);
-	gtk_widget_show(window);
-
-	/* All GTK applications must have a gtk_main(). Control ends here
-	 * and waits for an event to occur (like a key press or
-	 * mouse event). */
-	gtk_main();
-
-	return 0;
-}
-
