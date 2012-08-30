@@ -50,7 +50,7 @@ building natively remove the ARCH and CROSS_COMPILE settings.
 
 As of August 31st 2012, the included module should load if you have recently
 run rpi-update.  Read the comments at the top of pandriver.c for how to
-create the /dev/paralyzer file.  The included Panalyzer binary uses gtk-3.0
+create the /dev/panalyzer file.  The included Panalyzer binary uses gtk-3.0
 and should run on Raspbian, at least.
 
 Feedback welcome.
