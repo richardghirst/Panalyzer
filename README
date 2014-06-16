@@ -42,20 +42,198 @@ Panalyzer is the user space application that displays the data.
 Panalyzer.ui is a Glade generated UI definition, and must be located in
 the directory Panalyzer is invoked from.
 
-If you wish to compile the module yourself, you should follow the instructions
-on the wiki to compile the kernel, then edit the Makefile to point at your
-kernel tree, and then run 'make' in the Panalyzer source directory.  The
-Makefile is currently set up to cross-compile the kernel module; if you are
+As of June 16th 2014, the included module should load if you have recently
+run rpi-update (and so are running kernel 3.12.22+).  Read the comments at the
+top of pandriver.c for how to create the /dev/panalyzer file.  The included
+Panalyzer binary uses gtk-3.0 and should run on Raspbian, at least.
+
+Compiling:
+
+To build the UI (Panalyzer) on Raspbian, you need to
+"sudo apt-get install libgtk-3-dev", and the simply "make Panalyzer".
+
+The Makefile is currently set up to cross-compile the kernel module; if you are
 building natively remove the ARCH and CROSS_COMPILE settings.
 
-As of August 31st 2012, the included module should load if you have recently
-run rpi-update.  Read the comments at the top of pandriver.c for how to
-create the /dev/panalyzer file.  The included Panalyzer binary uses gtk-3.0
-and should run on Raspbian, at least.
+Building the module can be painful because you need matching kernel headers.
+Many people run Raspbian (as I do), and by default that ships a packaged kernel
+with matching headers, but does not install it.  Instead, Raspbian runs a 
+kernel from the RaspberryPi foundation, for which matching headers are not
+available.  Also, to compile a kernel against which you can compile Panalyzer
+(and get a module that will load), you need to have exactly the right kernel
+source.
+
+In theory you can short-circuit some of this process by running some "module
+prepare" step rather thana full make, but I haven't had success with that.
+
+In the past I have found that compiling the module on the Pi itself results
+in a moduel that does not work; I presume that was due to some compiler bug,
+but I've not investigated much, and I don't know if the issue has since been
+fixed.  However, I cross-compile the module on an Ubuntu host, which avoids
+that problem has is many times faster.
+
+The best instructions I have found for compiling the correct kernel source
+are here: <http://lnxpps.de/rpie/raspi-anleitung.txt>.  I have reproduced them
+in full below (with a few extra [rgh] notes), in case that link goes away:
+
+
+======================== http://lnxpps.de/rpie/raspi-anleitung.txt =============================
+
+
+How to Build the Modules for adding an mcp251x to a Raspberry Pi
+================================================================
+
+Note: The examples shown here were run with Kernel 3.10.24+ from Raspbian 2013-12-20.
+
+Chapter 1: Find your kernel hash and configuration (on the Pi)
+--------------------------------------------------------------
+
+- Find your kernel hash using either of the following methods:
+
+> FIRMWARE_HASH=$(zgrep "* firmware as of" /usr/share/doc/raspberrypi-bootloader/changelog.Debian.gz | head -1 | awk '{ print $5 }')
+> KERNEL_HASH=$(wget https://raw.github.com/raspberrypi/firmware/$FIRMWARE_HASH/extra/git_hash -O -)
+> echo $KERNEL_HASH
+4bbea92eae6c0792e85a4ba079d367ac6aa77fb5
+
+or, if you got your kernel via rpi-update (scroll down): https://github.com/raspberrypi/linux/issues/486
+
+- Get the configuration of your running kernel:
+
+> cp /proc/config.gz ~
+
+
+Chapter 2: Setup your build environment (on a different, *very* fast machine)
+-----------------------------------------------------------------------------
+
+See http://elinux.org/RPi_Kernel_Compilation for additional basic information.
+
+- Setup a Linux System or VM
+- make a folder for compilation:
+
+> mkdir ~/raspi; export BASEDIR=~/raspi; cd $BASEDIR
+
+- Get the kernel sources:
+
+[rgh: --depth 100 below was not enough for me; I used --depth 200]
+
+> cd $BASEDIR
+> git clone --depth 100 https://github.com/raspberrypi/linux.git
+> export KERNEL_SRC=$BASEDIR/linux
+> cd $KERNEL_SRC
+> git checkout 4bbea92eae6c0792e85a4ba079d367ac6aa77fb5
+
+[rgh: If that gives you some error about "is not a tree", you probably need a larger --depth value above]
+[rgh: I needed a "git pull" after that last "git checkout <hash>"]
+
+Note that the hash value for git checkout is the one you got in Chapter 1.
+
+- Get the Compiler
+
+[rgh: I run Ubuntu, so just installed the cross compiler from their repositories, as per http://elinux.org/RPi_Kernel_Compilation]
+
+> cd $BASEDIR
+> git clone git://github.com/raspberrypi/tools.git
+> export CCDIR=$BASEDIR/tools/arm-bcm2708/arm-bcm2708-linux-gnueabi/bin
+> export CCPREFIX=$CCDIR/arm-bcm2708-linux-gnueabi-
+
+Chapter 3: Compile the Kernel modules
+-------------------------------------
+
+- Prime the Kernel sources with the old configuration
+
+> cd $BASEDIR
+> scp pi@raspberry:config.gz .
+> cd $KERNEL_SRC
+> zcat $BASEDIR/config.gz > .config
+> ARCH=arm CROSS_COMPILE=${CCPREFIX} make oldconfig
+
+[rgh: You can skip the menuconfig command below]
+
+- Add the CAN modules and drivers to the configuration.
+
+> ARCH=arm CROSS_COMPILE=${CCPREFIX} make menuconfig
+
+For what options to select, see http://elinux.org/RPi_CANBus
+Note that when an option is selected to be compiled into the kernel (shows a *), you do *not* need to change that to module!
+
+- Compile the kernel
+
+> ARCH=arm CROSS_COMPILE=${CCPREFIX} make
+
+This will take a while. If you have multiple cores available in your VM, speed up compilation by using "-j <numcors+1>". So for my VM with 3 cores available, I use
+
+> ARCH=arm CROSS_COMPILE=${CCPREFIX} make -j 4
+
+[rgh: At this point fix the path in Panalyzer/Makefile to point at your kernel, and "make pandriver.ko".  Job done.]
+
+- Create a directory to temporarily deploy the modules in
+
+> mkdir $BASEDIR/modules
+> export MODULES_TEMP=$BASEDIR/modules
+
+- Deploy the modules:
+
+> ARCH=arm CROSS_COMPILE=${CCPREFIX} INSTALL_MOD_PATH=${MODULES_TEMP} make modules_install
+
+- Get the source for the spi-config module
+
+> cd $BASEDIR
+> git clone https://github.com/msperl/spi-config
+> cd spi-config
+
+- Build the spi-config module
+
+> ARCH=arm CROSS_COMPILE=${CCPREFIX} make KDIR=$KERNEL_SRC
+
+- Deploy the spi-config module
+
+> ARCH=arm CROSS_COMPILE=${CCPREFIX} INSTALL_MOD_PATH=${MODULES_TEMP} make KDIR=$KERNEL_SRC install
+
+- Pack all necessary modules into one tar file:
+
+> cd $MODULES_TEMP
+> tar -cjf rpi-can-modules.tar.bz2 \
+lib/modules/3.10.24+/kernel/net/can/can.ko \
+lib/modules/3.10.24+/kernel/net/can/can-raw.ko \
+lib/modules/3.10.24+/kernel/net/can/can-gw.ko \
+lib/modules/3.10.24+/kernel/net/can/can-bcm.ko \
+lib/modules/3.10.24+/kernel/drivers/net/can/mcp251x.ko \
+lib/modules/3.10.24+/kernel/drivers/net/can/can-dev.ko \
+lib/modules/3.10.24+/kernel/drivers/spi/spi-bcm2708.ko \
+lib/modules/3.10.24+/extra/spi-config.ko
+
+- Copy the resulting archive to the Pi
+
+> scp rpi-can-modules.tar.bz2 pi@raspberrypi:
+
+Chapter 4: Deploy the modules on the Pi (on the Pi, obviously)
+--------------------------------------------------------------
+
+- Exctract the modules
+
+> cd /
+> sudo tar -xjf ~/rpi-can-modules.tar.bz2
+> sudo depmod -a
+
+- Test-load the modules
+
+> sudo modprobe spi-bcm2708
+> sudo modprobe can
+> sudo modprobe can-dev
+> sudo modprobe can-raw
+> sudo modprobe can-bcm
+> sudo modprobe spi-config devices=\
+bus=0:cs=0:modalias=mcp2515:speed=10000000:gpioirq=25:pd=20:pds32-0=16000000:pdu32-4=0x2002:force_release
+
+If you see "mcp251x spi0.0: probed", it worked.
+
+================== End of http://lnxpps.de/rpie/raspi-anleitung.txt =========================
+
+
 
 Feedback welcome.
 
-Richard Hirst <richardghirst@gmail.com>  August 31st 2012
+Richard Hirst <richardghirst@gmail.com>  June 16th 2014
 
 ['rgh' on the RaspberryPi forum]
 
